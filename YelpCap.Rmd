@@ -1,0 +1,395 @@
+---
+title: 'Choosing fast food menu: burgers or sandwiches, based on the surrounding infrastructure  using
+  Yelp data set'
+author: "Dmytro Savich"
+date: "Saturday, November 21, 2015"
+output: pdf_document
+---
+
+#Introduction
+
+People all over the world like fast food. It is mostly unhealthy, but very convenient if you are in a hurry. Very popular fast food "dishes" are burgers and sandwiches. Using Yelp data set I'll try to understand the differences between people who like burgers and those who prefer sandwiches. In addition I'll look at the data from the fast food owner perspective: are there any reasons to go with burgers or sandwiches, and how location might influence the decision. Planning fast food menu is very important as the profit relies heavily on the number of people attending. 
+So the main goal of this paper is to understand how the two group of yelp users differ, and can we recommend a menu of a fast food based on surrounding places.
+
+#Methods and Data
+
+###Exploratory data analysis
+As mentioned above all analyses are done using Yelp data set. It includes five files in json format and could be downloaded from [here](http://www.yelp.com/dataset_challenge). Files appeared to have nested data frames after they were downloaded. Those data frames where flattened using 'flatten()' method from 'jsonlite' package. Take a look at the table below for more information on the resulting files:
+
+```{r echo=FALSE,warning=FALSE,message=FALSE,results='hide'}
+        ##loading libraries and methods
+        require(reshape2,quietly = TRUE);
+        require(jsonlite,quietly = TRUE);
+        require(dplyr,quietly = TRUE);
+        require(tm, quietly = TRUE);
+        require(RWeka, quietly = TRUE);
+        require(wordcloud, quietly = TRUE);
+        require(lubridate, quietly = TRUE);
+        require(ggplot2, quietly = TRUE);
+        require(SnowballC, quietly = TRUE);
+        require(tidyr, quietly = TRUE);
+        require(arules, quietly = TRUE);
+        require(gridExtra, quietly = TRUE);
+        require(grid, quietly = TRUE);
+        require(parallel, quietly = TRUE);
+        require(doParallel, quietly = TRUE); 
+        require(png,quietly = TRUE);
+
+        source("readCapData.R");
+        source("removeNested.R");
+        source("makeNgramms.R");
+        source("getBusinessType.R");
+        
+        cl <- makePSOCKcluster(4)
+        registerDoParallel(cl)
+
+
+
+        ##Create list to hold all the data
+       data_list <- list(business = data.frame, checkin = data.frame, review = data.frame, 
+                         tip = data.frame, user = data.frame);
+        
+        list_length <- length(data_list);
+        
+        #Read the data
+      foreach(i = 1:list_length) %do%{
+               data_list[[i]] <- readCapData(paste("yelp_academic_dataset_",
+                                                   names(data_list)[i],".json",sep = ""));
+      }   
+        
+        attach(data_list)
+      
+        
+          
+       
+        
+             
+        ##create data table to show
+        data_table <- data.frame(Observations = c(dim(business)[1],dim(review)[1],dim(checkin)[1],dim(tip)[1],dim(user)[1]),
+                                 Parameters = c(dim(business)[2],dim(review)[2],dim(checkin)[2],dim(tip)[2],dim(user)[2]),
+                                 File_Size = c(object.size(business),object.size(review),object.size(checkin),object.size(tip),object.size(user)));
+        row.names(data_table) <- c("Business","Review","Check_in","Tip","User");
+        
+       write.csv(file = "data_table.csv", data_table)  
+        
+        
+        
+    data_table <- read.csv(file = "data_table.csv",header = TRUE);
+    names(data_table)[1] <- ""  
+    data_table$File_Size <- round(data_table$File_Size/1024/1024,3)
+    names(data_table)[4] <- "File_Size_Mb" 
+```
+
+```{r echo=FALSE, warning=FALSE}
+        print(data_table);
+```
+
+First lets get fast foods that serve burgers and sandwiches and see how they are distributed: 
+```{r echo=FALSE, warning=FALSE}
+        index <- getBusinessType(business$categories,"Restaurants");
+        restaurants <- business[index,];
+        
+        ##merge restaurants with reviews
+        restrev <- merge(review, restaurants, by = "business_id");
+        
+        ##get fast food
+        indexf <- getBusinessType(data = restrev$categories, "Fast Food");
+        ffood <- restrev[indexf,];
+        ##seperate data by types of restaurants and find out what people like or dislike about fast food in diferent cities
+        indexb <- getBusinessType(data = ffood$categories, "Burgers"); ##get those serving Burgers
+        bfood <- ffood[indexb,];
+        indexNoSandw <- getBusinessType(data = bfood$categories, "Sandwiches"); ##get indexwith sandwiches
+        bfood <- bfood[!indexNoSandw,]; ## removing sandwiches
+        
+        indexs <- getBusinessType(data = ffood$categories, "Sandwiches"); ##get those serving Sandwiched
+        sfood <- ffood[indexs,];
+        indexNoBurg <- getBusinessType(data = sfood$categories, "Burgers"); ##get indexwith burgers
+        sfood <- sfood[!indexNoBurg,];## removing Burgers
+        
+        ##create data table to show
+        data_table <- data.frame(Group.Size = c(dim(sfood)[1],dim(bfood)[1]),
+                                 Average.Rating = c(mean(sfood$stars.y),mean(bfood$stars.y)),
+                                 Percentage.From.All.Businesses = c(dim(sfood)[1]/dim(review)[1],dim(bfood)[1]/dim(review)[1]));
+        row.names(data_table) <- c("Sandwiches", "Burgers");
+        
+        print(data_table)
+```
+
+The table above shows the mean difference in ratings for two groups, but to understand if it happened by chance or not tests have to be ran. We can't just assume normality of the data, so qnorm plot below will help to understand this issue:
+
+```{r echo=FALSE, warning=FALSE}
+        par(mfrow = c(1,2))
+        qqnorm(sfood$stars.y, main = "Sandwiches")
+        qqline(sfood$stars.y, col = 2)
+        qqnorm(bfood$stars.y, main = "Burgers")
+        qqline(bfood$stars.y, col = 2)
+```
+
+Plots above prove that we cannot assume normality of the data, so t-test or any other test that assumes data normality can't be used. I will go with Wilcoxon-Mann-Whitney test (u-test), to test my null hypothesis.
+
+I'll start with assumption that people who like burgers and people who like sandwiches have no differences, and that fast food taste do not determine groups from one another. So my H~0~ is that both groups come from the same population.
+
+```{r echo = FALSE, warning=FALSE}
+testresults <- wilcox.test(bfood$stars.y,sfood$stars.y)
+
+```
+So with the p-value equal to ```r testresults$p.value``` we reject the null hypotheses. We can say that groups come from different populations and the mean difference is statistically significant. Which means that bars with sandwiches are rated higher on average than those with burgers. But is it because sandwich bars are better, or do people who prefer sandwiches rate higher. I took people who gave either burger or sandwich bars the highest marks (4 or 5) and compared the mean ratings of the two groups of users. Here are the u-test results (H~0~ - groups come from the same population):
+
+```{r echo = FALSE, warning=FALSE}
+        ##exclude burgers and sandwiches from the business data.
+        restrevnofastfood <- business[!(business$business_id%in%bfood$business_id),]
+        restrevnofastfood <- restrevnofastfood[!(restrevnofastfood$business_id%in%sfood$business_id),]
+        
+        ##merge this data with reviews
+        restrevnofastfood <- merge(review, restrevnofastfood, by = "business_id");
+
+        ##select only top burger reviews 
+        bhigh <- unique(bfood[bfood$stars.x %in% c(4,5),])
+        
+        ##select only top sandwich reviews
+        shigh <- unique(sfood[sfood$stars.x %in% c(4,5),])
+        
+                
+        ##remove them
+        both <- shigh$user_id %in% bhigh$user_id
+        both2 <- bhigh$user_id %in% shigh$user_id
+        
+        ##users that rated highly only sandwich or burger
+        shigh<-shigh[!both,]
+        bhigh<-bhigh[!both2,]
+        
+        #the mean rate could be low after all
+        smean<-shigh%>%group_by(user_id)%>%summarise(mean(stars.y))
+        bmean<-bhigh%>%group_by(user_id)%>%summarise(mean(stars.y))
+        
+        
+        ##get to groups of users for whole reviews
+        breviews <- restrevnofastfood[restrevnofastfood$user_id %in% bhigh$user_id,]
+        sreviews <- restrevnofastfood[restrevnofastfood$user_id %in% shigh$user_id,]
+        
+         
+        
+        ##lets see what people who like burgers also like (4,5 stars)
+        blikes <- breviews[breviews$stars.x %in% c(4,5),]
+        
+        ##and those who like sandwiches
+        slikes <- sreviews[sreviews$stars.x %in% c(4,5),]
+        
+               
+        
+        ##Wilcoxon-Mann-Whitney U-test
+        set.seed(1234)
+        testresults2 <- wilcox.test(sreviews$stars.x, breviews$stars.x, alternative = "greater")
+        print(testresults2)
+```
+The test results clearly showed that people who like sandwiches, tend to rate everything higher than those who like burgers. The p-value is less then 0.05 and thus we reject the null hypothesis. 
+Now we see that when it comes to ratings sandwich lovers are more generous, and tend to rate higher. The data also provides us with the information about the city the business is located, and if we assume that people go to fast foods in the same city they live, we can find out how sandwich and burger lovers differ by city (Remember we're talking only about people who gave 4-5 stars to either burger fast food or sandwich). See below the plot of a ratio of 4-5 stars ratings and the whole number of ratings by city.
+
+```{r echo = FALSE, warning=FALSE}
+        # lets see where burger lovers and sandwich lovers located
+        slocation <- sort(table(shigh$city),decreasing = TRUE);
+        blocation <- sort(table(bhigh$city),decreasing = TRUE);
+
+        blocation <-data.frame(city = names(blocation), Burgers = blocation);
+        slocation<-data.frame(city = names(slocation), Sandwiches = slocation);
+        row.names(blocation) <- NULL;
+        row.names(slocation) <- NULL;
+        
+        snum <- sfood%>%group_by(city)%>%summarise(length(stars.y));
+        bnum <- bfood%>%group_by(city)%>%summarise(length(stars.y));
+        
+        slocation <- slocation[slocation$city %in% snum$city,];
+        blocation <- blocation[blocation$city %in% bnum$city,];
+        slocation <- merge(slocation,snum,by = "city");
+        blocation <- merge(blocation,bnum,by = "city");
+        slocation$Sandwiches.Ratio <- slocation$Sandwiches/slocation$"length(stars.y)"
+        blocation$Burgers.Ratio <- blocation$Burgers/blocation$"length(stars.y)"
+        blocation <- blocation%>%arrange(desc(Burgers.Ratio))
+        slocation <- slocation%>%arrange(desc(Sandwiches.Ratio))
+```
+        
+```{r echo = FALSE, warning=FALSE}        
+        blocation.plot <- ggplot(data = head(blocation,10),aes(x = reorder(city,-Burgers.Ratio),Burgers.Ratio, fill = Burgers.Ratio))
+        blocation.plot <- blocation.plot + geom_bar(stat="identity")
+        blocation.plot <- blocation.plot + labs(x = "Top ten cities", y = "Review ratio")
+        blocation.plot <- blocation.plot + theme(axis.text.x = element_text(angle = 45))
+        blocation.plot <- blocation.plot + guides(fill = FALSE)
+        blocation.plot <- blocation.plot + ggtitle("Burgers")
+        
+        slocation.plot <- ggplot(data = head(slocation,10),aes(x = reorder(city,-Sandwiches.Ratio),Sandwiches.Ratio, fill = Sandwiches.Ratio))
+        slocation.plot <- slocation.plot + geom_bar(stat="identity")
+        slocation.plot <- slocation.plot +labs(x = "Top ten cities")
+        slocation.plot <- slocation.plot + theme(axis.text.x = element_text(angle = 45), axis.title.y = element_blank())
+        slocation.plot <- slocation.plot + guides(fill = FALSE)
+        slocation.plot <- slocation.plot + ggtitle("Sandwiches")
+        
+        grid.list <- list(blocation = blocation.plot, slocation = slocation.plot)
+        
+        grid.view <- marrangeGrob(grid.list, nrow=1, ncol=2, top = "Positive fast food reviews by city")
+        grid.view
+```
+
+We can see from the plot that top cities by review ratio are really different, in fact only `r sum(head(blocation$city,10)%in%head(slocation$city,10))` cities out of top 10 for each group overlap. To understand more about what people who rated burgers or sandwiches highly in those cities we can look at the wordclouds with green for burgers and orange for sandwiches.
+```{r echo=FALSE,warning=FALSE, fig.align='left'}
+        bword <- bfood$text[blocation$city %in% bfood$city]
+        
+        trigramms <- paste(bword, collapse = " ");
+        trigramms <- makeNgramms(trigramms,3,sparsity = .4);
+        matrix<-as.matrix(trigramms);
+        write.csv(matrix, file("trib.csv"));
+        
+        dataForCloud <- read.csv("trib.csv");
+        names(dataForCloud) <- c("words","wordcount");
+        png("bcloud.png")
+        wordcloud(dataForCloud$words, dataForCloud$wordcount, random.order=FALSE, max.words = 80, colors=brewer.pal(n = 5,name = "Greens"));
+        dev.off()
+        
+        
+        sword <- sfood$text[slocation$city %in% sfood$city]
+        
+        trigramms <- paste(sword, collapse = " ");
+        trigramms <- makeNgramms(trigramms,3,sparsity = .4);
+        matrix<-as.matrix(trigramms);
+        write.csv(matrix, file("tris.csv"));
+        
+        dataForCloudS <- read.csv("tris.csv");
+        names(dataForCloudS) <- c("words","wordcount");
+        png("scloud.png")
+        wordcloud(dataForCloudS$words, dataForCloudS$wordcount, random.order=FALSE, max.words = 80, colors=brewer.pal(n = 5, name = "Oranges"));
+        dev.off()   
+
+        
+        
+```
+
+
+![](bcloud.png) ![](scloud.png)
+
+At a quick glance on the text results we see that people value speed a lot in burger fast foods, where as sandwich lovers talk a lot about food itself: beef, brisket, turkey, etc. If burger lovers talk about food they generally mention the size of it, and of course fries, as that I believe is the most common that goes with burgers all over the world. On the other hand people who rated Sandwiches value customer service and friendly staff. 
+
+###Explaining methods
+As mentioned before, the main goal of this work is to find out if we can determine what to put on the fast food menu based in the surrounding environment or not. I will use an association rule mining method called apriori. It is mostly used for market basket analysis, but if we think of a street or a shopping mall as a supermarket, where shops, entertainment centers, cafes, etc., are the goods on the supermarket shelves, we can easily apply apriori to our problem. So we need to find where people who like burgers or sandwiches also go to.  To achieve this I've created a table that hold user_id as a unique key and a list of places that person rated. So apriori will devide the data into antecedent and consequent, in other words, if given several places person rated, what is the probability(it will be shown as confidance in the table below) that he/she also rated burgers for example.  
+
+```{r echo = FALSE}
+    busmin <- business%>%select(business_id,categories)
+    revmin <- review%>%select(business_id,user_id)
+    dmining <- merge(busmin,revmin, by = "business_id")
+    dmining <- dmining%>%select(user_id,categories)
+    bmining <- dmining%>%filter(user_id %in% bfood$user_id)
+    
+    smining <- dmining%>%filter(user_id %in% sfood$user_id)  
+    
+    dmining$categories <- as.factor(dmining$categories)
+    dmining$user_id <- as.factor(dmining$user_id)
+    
+    dmining <- dmining[dmining$categories != "Burgers",]
+    
+    
+    aprioryList <- lapply(unique(dmining$user_id),function(x){
+                            return("")
+                    })
+    names(aprioryList) <- unique(dmining$user_id)
+    
+    
+    ##populate list with business categories for each user_id as transaction name apply version.
+    aprioryList2 <- mclapply(names(aprioryList),function(x){
+                        aprioryList[[as.character(x)]] <- unique(dmining$categories[dmining$user_id == x])
+                        aprioryList[[as.character(x)]] <- unique(aprioryList[[as.character(x)]])
+                        return(aprioryList[[as.character(x)]])
+                }, mc.cores = 4)
+    
+    
+    
+    apriori_tab <- as.data.frame(head(summary(aprioryList2)));
+    apriori_tab <- data.frame(user_id = head(unique(dmining$user_id)), "Number of places rated" = as.numeric(unlist(apriori_tab)))
+    apriori_tab <- cbind(head(unique(dmining$user_id)),as.vector(apriori_tab))
+    names(apriori_tab) <- c("Number of places rated","user_id")
+ 
+```
+Now we can turn list into transactions data and run apriori algorithm provided to us by "arules" package. And the result hopefully will show the most common places(item sets) that people with burgers or sandwiches attended. 
+
+```{r echo=FALSE, results='hide'}
+       trans <- as(aprioryList2, "transactions"); 
+       rules<-apriori(trans,parameter=list(supp=.05, conf=.8, target="rules"))
+       result <- inspect(rules)
+       result <- cbind.data.frame(as.vector(result$lhs),as.vector(result$rhs),result$support,result$confidence,result$lift)
+      
+       result<-data.frame(apply(result,2,as.character),stringsAsFactors = FALSE)
+       result <- result[2:dim(result)[1],2:6]
+       names(result) <- c("lhs","rhs","support","confidance","lift")
+       result$support<-as.numeric(result$support)
+       result$confidance<-as.numeric(result$confidance)
+       result$lift<-as.numeric(result$lift)
+     
+       result$lhs <-  vapply(result$lhs,FUN = function(x){
+                  x <-substr(x = x, start = 2,stop = nchar(x)-1)
+                        },FUN.VALUE = "vector")
+       
+       
+       result$rhs <-  vapply(result$rhs,FUN = function(x){
+                   x <-substr(x = x, start = 2,stop = nchar(x)-1)
+                   print(x)
+                   return(x)
+                        },FUN.VALUE = "vector")
+       
+
+
+
+
+
+       resultB<-result%>%filter(rhs=="Burgers")
+       resultS<-result%>%filter(rhs=="Sandwiches")
+       
+       ##removing sandwiches from burger 
+       index<-grepl(x = resultB$lhs,pattern = "Sandwiches")
+       resultB <- resultB[!index,]
+       
+       ##removing burger from sandwiches
+       index<-grepl(x = resultS$lhs,pattern = "Burgers")
+       resultS <- resultS[!index,]
+       
+       resultB <- resultB%>%arrange(desc(confidance))
+       
+       resultS <- resultS%>%arrange(desc(confidance))
+       
+       final <- merge(resultB,resultS, by = "lhs")
+       final <- final%>%select(lhs,support.x,support.y,confidance.x,confidance.y)
+       names(final) <- c("Businesses","B.Sup","S.Sup","B.conf","S.conf")
+   
+       
+```
+
+In this example I've used apriori support and confidence threshold equal to 0.05 and 0.8. to eliminate all uncommon results. Here I've worked with only those users who actually rated either burgers or sandwiches or both. I could not use the whole database due to the size issues. I've also removed after applying apriori transactions where antecedent included sandwiches for the burgers consequent and vice versa. 
+
+
+#Results
+The resulting association rules show that we have `r dim(result)[1]` number of rules and `r dim(final)[1]` are common for both groups. The table below shows 6 support and confidence results for burgers and sandwiches (for rules that are in common): 
+
+```{r echo=FALSE}
+   head(final[nchar(final$Businesses) < mean(nchar(final$Businesses) ),])    
+```
+So if we look at the first line for example, "Arts & Entertainment|Cinema" appear with Burgers 96% of times and 85% with sandwiches and 13% of all transactions both burgers and "Arts & Entertainment|Cinema" appear together, and it is 12% for sandwiches. 
+We can see that support and confidence for burgers is always slightly bigger, to prove it by the test we should check the data normality first. And using the Shapiro-Wilk test of normality we fail to reject the H~0~ with the p-value < `r round(shapiro.test(final$B.Sup)$p.value,3)` for burger support, and ```r round(shapiro.test(final$S.Sup)$p.value,3)``` for sandwich. We can now perform the t.test to see if the obtained results are statistically significant. So the null hypothesis is that there is no difference between two groups. And the alternative is that burgers are more common than sandwiches. 
+So we can run the t-test to see if this happened by chance or the results are statistically significant. 
+```{r echo = FALSE}
+    testres <- t.test(final$B.Sup,final$S.Sup)
+```
+So with the p-value = `r round(testres$p.value,3)` (almost 0.05) but not quite, we look at the 95% confidence interval [`r round(testres$conf.int[1],3)`,`r round(testres$conf.int[2],3)`] and as it includes zero we fail to reject the H~0~. However what trully distinguishes burgers from sandwiches in this case is the confidance, as it shows what is the probability of the consequent given the antecedent. The Shapiro-Wilk test showd that the data is not normali distributed with p-value = `r round(shapiro.test(final$B.conf)$p.value,3)` for burgers and `r round(shapiro.test(final$S.conf)$p.value,3)` for sandwiches. So we apply Wilcoxon test to see if the groups come from the same population. The resulting p-value is ```r wilcox.test(final$S.conf,final$B.conf)$'p.value'``` shows that the two groups are from the different populations. 
+Below is the list of locations people who like burgers also go to with more than 95% confidence:
+```{r echo=FALSE}
+    toprint <- resultB$lhs[resultB$confidance>0.95] 
+    print(toprint)
+    stopCluster(cl);
+```
+Sandwich lovers also attend this places, but not as frequently.
+
+#Discussion
+Based on the confidance results I'd like to conclude that if choosing between burgers or sandwiches (and you have to pick only one), generaly I would recommend fast food owners to go with burgers. Even though sandwich lovers tend to rate businesses higher, burger fast foods are attended more frequently and thus might be more profitable. Sandwich lovers generaly rated the same places burger lovers did, however "Car Wash|Automotive" category was rated surprisingly only by burger lovers (if we'are using minimum confidance threshold == 0.8). So if you're located near car wash - sell burgers, serve them fast and serve them with fries.  
+Of course, the descissions may depend on other factors (other than surrounding hotspots), like city your business is located in. In general the two groups of people that tend to rate burger or sandwich fast foods higher than the other are in fact different: starting from the city they live, in all the way through to the things they value in fast food restaurants. 
+I am planning on digging deeper into the problem, by analyzing the days people attend different fast foods using check-in table. Fast food's geografical location not only by city, but also taking geografical coordinates into account, would definetly be of interest too.   
+
+
+
+
+
+
